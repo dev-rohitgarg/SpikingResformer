@@ -123,8 +123,216 @@ class DownsampleLayer(nn.Module):
         x = self.norm(x)
         return x
 
-
 class SpikingResformer(nn.Module):
+    def __init__(
+        self,
+        layers: List[List[str]],
+        planes: List[int],
+        num_heads: List[int],
+        patch_sizes: List[int],
+        img_size=224,
+        T=4,
+        in_channels=3,
+        num_classes=1000,
+        prologue=None,
+        group_size=64,
+        activation=LIF,  # Ensure LIF is defined elsewhere in your code
+        **kwargs,
+    ):
+        super().__init__()
+        self.T = T
+        self.skip = ['prologue.0', 'classifier']
+        assert len(planes) == len(layers) == len(num_heads) == len(patch_sizes)
+
+        # Prologue
+        if prologue is None:
+            self.prologue = nn.Sequential(
+                layer.Conv2d(in_channels, planes[0], 7, 2, 3, bias=False, step_mode='m'),
+                BN(planes[0]),  # Ensure BN is defined elsewhere (Batch Normalization layer)
+                layer.MaxPool2d(kernel_size=3, stride=2, padding=1, step_mode='m'),
+            )
+            img_size = img_size // 4
+        else:
+            self.prologue = prologue
+
+        # Layers
+        self.layers = nn.ModuleList()  # Use ModuleList instead of Sequential
+        for idx in range(len(planes)):
+            sub_layers = nn.Sequential()
+            if idx != 0:
+                sub_layers.add_module(
+                    f"downsample_{idx}",
+                    DownsampleLayer(planes[idx - 1], planes[idx], stride=2, activation=activation)  # Ensure DownsampleLayer is defined
+                )
+                img_size = img_size // 2
+            for i, name in enumerate(layers[idx]):
+                if name == 'DSSA':
+                    sub_layers.add_module(
+                        f"DSSA_{idx}_{i}",
+                        DSSA(planes[idx], num_heads[idx], (img_size // patch_sizes[idx])**2,
+                             patch_sizes[idx], activation=activation)  # Ensure DSSA is defined
+                    )
+                elif name == 'GWFFN':
+                    sub_layers.add_module(
+                        f"GWFFN_{idx}_{i}",
+                        GWFFN(planes[idx], group_size=group_size, activation=activation)  # Ensure GWFFN is defined
+                    )
+                else:
+                    raise ValueError(f"Unknown layer type: {name}")
+            self.layers.append(sub_layers)
+
+        # AvgPool and Classifier
+        self.avgpool = layer.AdaptiveAvgPool2d((1, 1), step_mode='m')
+        self.classifier = Linear(planes[-1], num_classes)  # Ensure Linear is defined elsewhere
+        self.init_weight()
+
+    def init_weight(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def transfer(self, state_dict: Mapping[str, Any]):
+        _state_dict = {k: v for k, v in state_dict.items() if 'classifier' not in k}
+        return self.load_state_dict(_state_dict, strict=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+            assert x.dim() == 5
+        else:
+            # [B, T, C, H, W] -> [T, B, C, H, W]
+            x = x.transpose(0, 1)
+
+        # Pass through prologue
+        x = self.prologue(x)
+
+        # Pass through layers
+        for sub_layers in self.layers:
+            x = sub_layers(x)  # Sequential layers
+
+        # Pool and classify
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)  # Flatten before feeding into the classifier
+        x = self.classifier(x)
+        return x
+
+    def no_weight_decay(self):
+        ret = set()
+        for name, module in self.named_modules():
+            if isinstance(module, PLIF):  # Ensure PLIF is defined elsewhere
+                ret.add(name + '.w')
+        return ret
+
+# class SpikingResformer(nn.Module):
+#     def __init__(
+#         self,
+#         layers: List[List[str]],
+#         planes: List[int],
+#         num_heads: List[int],
+#         patch_sizes: List[int],
+#         img_size=224,
+#         T=4,
+#         in_channels=3,
+#         num_classes=1000,
+#         prologue=None,
+#         group_size=64,
+#         activation=LIF,
+#         **kwargs,
+#     ):
+#         super().__init__()
+#         self.T = T
+#         self.skip = ['prologue.0', 'classifier']
+#         assert len(planes) == len(layers) == len(num_heads) == len(patch_sizes)
+
+#         # Prologue
+#         if prologue is None:
+#             self.prologue = nn.Sequential(
+#                 layer.Conv2d(in_channels, planes[0], 7, 2, 3, bias=False, step_mode='m'),
+#                 BN(planes[0]),
+#                 layer.MaxPool2d(kernel_size=3, stride=2, padding=1, step_mode='m'),
+#             )
+#             img_size = img_size // 4
+#         else:
+#             self.prologue = prologue
+
+#         # Layers
+#         self.layers = nn.ModuleList()  # Use ModuleList instead of Sequential
+#         for idx in range(len(planes)):
+#             sub_layers = nn.Sequential()
+#             if idx != 0:
+#                 sub_layers.add_module(
+#                     f"downsample_{idx}",
+#                     DownsampleLayer(planes[idx - 1], planes[idx], stride=2, activation=activation)
+#                 )
+#                 img_size = img_size // 2
+#             for i, name in enumerate(layers[idx]):
+#                 if name == 'DSSA':
+#                     sub_layers.add_module(
+#                         f"DSSA_{idx}_{i}",
+#                         DSSA(planes[idx], num_heads[idx], (img_size // patch_sizes[idx])**2,
+#                              patch_sizes[idx], activation=activation)
+#                     )
+#                 elif name == 'GWFFN':
+#                     sub_layers.add_module(
+#                         f"GWFFN_{idx}_{i}",
+#                         GWFFN(planes[idx], group_size=group_size, activation=activation)
+#                     )
+#                 else:
+#                     raise ValueError(f"Unknown layer type: {name}")
+#             self.layers.append(sub_layers)
+
+#         # AvgPool and Classifier
+#         self.avgpool = layer.AdaptiveAvgPool2d((1, 1), step_mode='m')
+#         self.classifier = Linear(planes[-1], num_classes)
+#         self.init_weight()
+
+#     # def init_weight(self):
+#     #     # Add weight initialization logic if needed
+#     #     pass
+#     def init_weight(self):
+#         for m in self.modules():
+#             if isinstance(m, (nn.Linear, nn.Conv2d)):
+#                 nn.init.trunc_normal_(m.weight, std=0.02)
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+#             elif isinstance(m, nn.BatchNorm2d):
+#                 nn.init.constant_(m.weight, 1)
+#                 nn.init.constant_(m.bias, 0)
+
+
+#     def transfer(self, state_dict: Mapping[str, Any]):
+#         _state_dict = {k: v for k, v in state_dict.items() if 'classifier' not in k}
+#         return self.load_state_dict(_state_dict, strict=False)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         if x.dim() != 5:
+#             x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+#             assert x.dim() == 5
+#         else:
+#             #### [B, T, C, H, W] -> [T, B, C, H, W]
+#             x = x.transpose(0, 1)
+#         x = self.prologue(x)
+#         x = self.layers(x)
+#         x = self.avgpool(x)
+#         x = torch.flatten(x, 2)
+#         x = self.classifier(x)
+#         return x
+
+#     def no_weight_decay(self):
+#         ret = set()
+#         for name, module in self.named_modules():
+#             if isinstance(module, PLIF):
+#                 ret.add(name + '.w')
+#         return ret
+    
+
+
+'''class SpikingResformer(nn.Module):
     def __init__(
         self,
         layers: List[List[str]],
@@ -177,43 +385,7 @@ class SpikingResformer(nn.Module):
         self.avgpool = layer.AdaptiveAvgPool2d((1, 1), step_mode='m')
         self.classifier = Linear(planes[-1], num_classes)
         self.init_weight()
-
-    def init_weight(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-    def transfer(self, state_dict: Mapping[str, Any]):
-        _state_dict = {k: v for k, v in state_dict.items() if 'classifier' not in k}
-        return self.load_state_dict(_state_dict, strict=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 5:
-            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
-            assert x.dim() == 5
-        else:
-            #### [B, T, C, H, W] -> [T, B, C, H, W]
-            x = x.transpose(0, 1)
-        x = self.prologue(x)
-        x = self.layers(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 2)
-        x = self.classifier(x)
-        return x
-
-    def no_weight_decay(self):
-        ret = set()
-        for name, module in self.named_modules():
-            if isinstance(module, PLIF):
-                ret.add(name + '.w')
-        return ret
-
-
+'''
 @register_model
 def spikingresformer_ti(**kwargs):
     return SpikingResformer(

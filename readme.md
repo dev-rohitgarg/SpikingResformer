@@ -82,3 +82,8 @@ Experimental setups on other datasets can be found in `configs/direct_training`.
     year={2024}
 }
 ```
+
+
+for my code
+
+python main.py -c configs/direct_training/cifar10.yaml --data-path /iitdh/home/aayushv/scratch/SpikingResformer/dataset --output-dir /iitdh/home/aayushv/scratch/SpikingResformer/output

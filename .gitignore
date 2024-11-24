@@ -6,6 +6,11 @@ __pycache__/
 # C extensions
 *.so
 
+
+#Dataset
+cifar-10-python
+c:UsersgargrOneDriveDocumentsspikingResformerSpikingResformerdataset
+c:UsersgargrOneDriveDocumentsspikingResformerSpikingResformeroutput
 # Distribution / packaging
 .Python
 build/
